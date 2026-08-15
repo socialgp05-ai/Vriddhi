@@ -57,81 +57,111 @@ def scrape_ir_website(url):
 # 2. IND-AS ALGORITHMIC PDF PARSER (NO HARDCODING)
 # ==============================================================================
 def parse_indas_pdf(pdf_bytes):
-    # Mathematically scans PDF tables for standard Indian Accounting Standards (Ind-AS) rows
+    """
+    Intelligently searches the entire Annual Report (200+ pages)
+    for the Consolidated Statement of Profit and Loss.
+    """
     extracted_data = {}
     periods = []
+    target_page_idx = None
     
     with pdfplumber.open(pdf_bytes) as pdf:
-        for page in pdf.pages[:20]:  # Scan first 20 pages for financial tables
-            tables = page.extract_tables()
-            for table in tables:
-                df = pd.DataFrame(table)
-                if df.empty or len(df.columns) < 2:
-                    continue
-                
-                df = df.replace(r'\n', ' ', regex=True)
-                first_col = df.iloc[:, 0].astype(str).str.lower()
-                
-                # Identify P&L table by looking for core revenue indicators
-                if first_col.str.contains('revenue from operations').any() or first_col.str.contains('total income').any():
-                    metrics = {
-                        "Revenue": ['revenue from operations', 'sale of products', 'total income'],
-                        "COGS": ['cost of materials', 'purchases of stock', 'changes in inventories', 'purchases of traded goods'],
-                        "Employee Expense": ['employee benefit'],
-                        "Other Expenses": ['other expenses', 'advertising', 'marketing'],
-                        "Depreciation": ['depreciation', 'amortisation'],
-                        "Finance Cost": ['finance cost'],
-                        "Profit Before Tax": ['profit before tax', 'profit before exceptional'],
-                        "Profit After Tax": ['profit for the period', 'profit after tax', 'net profit']
-                    }
-                    
-                    parsed_rows = {}
-                    for idx, row in df.iterrows():
-                        row_name = str(row[0]).lower()
-                        for metric_name, keywords in metrics.items():
-                            if any(kw in row_name for kw in keywords) and metric_name not in parsed_rows:
-                                vals = []
-                                for val in row[1:]:
-                                    # Clean string to extract float
-                                    val_str = str(val).replace(',', '').replace('(', '-').replace(')', '').strip()
-                                    try:
-                                        vals.append(float(val_str))
-                                    except:
-                                        pass
-                                if len(vals) >= 2:
-                                    parsed_rows[metric_name] = vals[:2] # Take Latest Period and Previous Period
-                                    
-                    if "Revenue" in parsed_rows:
-                        extracted_data = parsed_rows
-                        # Dynamic period assignment based on column discovery
-                        periods = ["Previous Period", "Latest Period"]
-                        break
-            if extracted_data:
-                break
-                
-    if not extracted_data:
-        return None, None
+        total_pages = len(pdf.pages)
         
-    # Reconstruct Standardized Decision Engine P&L
-    final_df = pd.DataFrame(index=["Revenue", "COGS", "Employee Expense", "Other Expenses", "EBITDA", "Depreciation", "Finance Cost", "PBT", "PAT"])
-    for p_idx, p_name in enumerate(periods):
-        rev = extracted_data.get("Revenue", [0,0])[p_idx]
-        cogs = abs(extracted_data.get("COGS", [0,0])[p_idx])
-        emp = abs(extracted_data.get("Employee Expense", [0,0])[p_idx])
-        oth = abs(extracted_data.get("Other Expenses", [0,0])[p_idx])
-        dep = abs(extracted_data.get("Depreciation", [0,0])[p_idx])
-        fin = abs(extracted_data.get("Finance Cost", [0,0])[p_idx])
-        pat = extracted_data.get("Profit After Tax", [0,0])[p_idx]
+        # Step 1: Scan all pages to find the exact Consolidated P&L statement
+        for idx, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            text_lower = text.lower()
+            
+            # Target Ind-AS Consolidated Statement of Profit and Loss
+            if ("statement of profit and loss" in text_lower or "profit and loss account" in text_lower) and \
+               ("revenue from operations" in text_lower or "total income" in text_lower):
+                # Prioritize Consolidated if present
+                if "consolidated" in text_lower:
+                    target_page_idx = idx
+                    break
+                elif target_page_idx is None:
+                    target_page_idx = idx
         
-        # EBITDA Derivation (Revenue - COGS - Employee - Other)
-        ebitda = rev - cogs - emp - oth if rev > 0 else 0
-        pbt = extracted_data.get("Profit Before Tax", [0,0])[p_idx]
-        if pbt == 0: pbt = ebitda - dep - fin
-        
-        final_df[p_name] = [rev, cogs, emp, oth, ebitda, dep, fin, pbt, pat]
-        
-    return final_df, periods
+        if target_page_idx is None:
+            return None, None
 
+        # Step 2: Extract text and tables from the target P&L page (+ next page if spilled over)
+        target_pages = [pdf.pages[target_page_idx]]
+        if target_page_idx + 1 < total_pages:
+            target_pages.append(pdf.pages[target_page_idx + 1])
+            
+        full_text = "\n".join([p.extract_text() or "" for p in target_pages])
+        
+        # Step 3: Identify Period Headers (e.g., Year ended March 31, 2026 / 2025)
+        found_years = re.findall(r'(?:20\d{2}|FY\d{2})', full_text)
+        unique_years = []
+        for y in found_years:
+            if y not in unique_years:
+                unique_years.append(y)
+        
+        if len(unique_years) >= 2:
+            periods = [unique_years[1], unique_years[0]]  # [Prior Year, Latest Year]
+        else:
+            periods = ["Prior Period", "Latest Period"]
+
+        # Step 4: Extract Standard Ind-AS Metrics using regex across the P&L text
+        metric_patterns = {
+            "Revenue": [r'revenue from operations[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)',
+                        r'total income[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "COGS": [r'cost of materials consumed[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)',
+                     r'purchases of stock-in-trade[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "Employee Expense": [r'employee benefits? expense[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "Other Expenses": [r'other expenses[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "Depreciation": [r'depreciation and amortisation[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "Finance Cost": [r'finance costs?[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "PBT": [r'profit before tax[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)'],
+            "PAT": [r'profit for the (?:year|period)[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)',
+                    r'total comprehensive income[^\d\n\-]*([\d,\.\(\)]+)[^\d\n\-]+([\d,\.\(\)]+)']
+        }
+
+        def clean_val(raw_str):
+            cleaned = str(raw_str).replace(',', '').replace('(', '-').replace(')', '').strip()
+            try:
+                return float(cleaned)
+            except:
+                return 0.0
+
+        parsed_metrics = {}
+        for metric, patterns in metric_patterns.items():
+            for pat in patterns:
+                match = re.search(pat, full_text, re.IGNORECASE)
+                if match:
+                    val_latest = clean_val(match.group(1))
+                    val_prior = clean_val(match.group(2))
+                    parsed_metrics[metric] = [val_prior, val_latest]
+                    break
+
+        if "Revenue" not in parsed_metrics:
+            return None, None
+
+        # Build Standardized P&L DataFrame
+        final_df = pd.DataFrame(index=[
+            "Revenue", "COGS", "Employee Expense", "Other Expenses", 
+            "EBITDA", "Depreciation", "Finance Cost", "PBT", "PAT"
+        ])
+        
+        for p_idx, p_name in enumerate(periods):
+            rev = parsed_metrics.get("Revenue", [0, 0])[p_idx]
+            cogs = abs(parsed_metrics.get("COGS", [0, 0])[p_idx])
+            emp = abs(parsed_metrics.get("Employee Expense", [0, 0])[p_idx])
+            oth = abs(parsed_metrics.get("Other Expenses", [0, 0])[p_idx])
+            dep = abs(parsed_metrics.get("Depreciation", [0, 0])[p_idx])
+            fin = abs(parsed_metrics.get("Finance Cost", [0, 0])[p_idx])
+            pat = parsed_metrics.get("PAT", [0, 0])[p_idx]
+            pbt = parsed_metrics.get("PBT", [0, 0])[p_idx]
+            
+            # Derive EBITDA
+            ebitda = rev - cogs - emp - oth if (cogs or emp or oth) else (pbt + dep + fin)
+            
+            final_df[p_name] = [rev, cogs, emp, oth, ebitda, dep, fin, pbt, pat]
+
+        return final_df, periods
 # ==============================================================================
 # 3. SIDEBAR: DYNAMIC DATA INGESTION
 # ==============================================================================
