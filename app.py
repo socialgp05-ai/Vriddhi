@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 import yfinance as yf
 import datetime
+import requests
 
 # ==========================================
 # 0. CONFIGURATION & STATE
@@ -39,7 +40,13 @@ POPULAR_COMPANIES = {
 @st.cache_data(ttl=3600)
 def fetch_live_company_data(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol)
+        # Anti-Rate-Limit: Disguise the cloud server as a standard web browser
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        })
+        
+        ticker = yf.Ticker(ticker_symbol, session=session)
         info = ticker.info
         
         # Financial Statements
@@ -48,6 +55,10 @@ def fetch_live_company_data(ticker_symbol):
         balance_sheet = ticker.balance_sheet
         cashflow = ticker.cashflow
         
+        # Check if data actually returned
+        if income_stmt is None or income_stmt.empty:
+            return {"status": "ERROR", "message": "Yahoo Finance returned empty data. The ticker might be delisted or temporarily unavailable."}
+            
         return {
             "info": info,
             "income_stmt": income_stmt,
@@ -57,7 +68,7 @@ def fetch_live_company_data(ticker_symbol):
             "status": "SUCCESS"
         }
     except Exception as e:
-        return {"status": "ERROR", "message": str(e)}
+        return {"status": "ERROR", "message": f"API Error: {str(e)}"}
 
 def parse_metrics_to_ledger(data_dict, ticker_symbol):
     ledger = []
@@ -222,7 +233,7 @@ def parse_metrics_to_ledger(data_dict, ticker_symbol):
 # 2. UI NAVIGATION & VIEWS
 # ==========================================
 
-st.sidebar.title("Decision Engine (Live v0.2)")
+st.sidebar.title("Decision Engine (Live v0.2.1)")
 st.sidebar.caption("Evidence-Backed Finance & Growth Architecture")
 
 # Company Selector
@@ -243,7 +254,7 @@ if st.sidebar.button("🔄 Fetch Live Financials", use_container_width=True) or 
             st.session_state.evidence_df = parse_metrics_to_ledger(res, active_ticker)
             st.toast(f"Data retrieved successfully for {active_ticker}!", icon="✅")
         else:
-            st.error(f"Error fetching data: {res.get('message')}")
+            st.error(f"{res.get('message')}")
 
 menu = [
     "Overview & Dashboard", 
